@@ -1,0 +1,5 @@
+streamlit>=1.40
+deep-translator
+gTTS
+requests
+anthropic>=2.1
