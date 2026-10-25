@@ -1,7 +1,9 @@
 import io
 import json
+import os
 from pathlib import Path
 import random
+import re
 import urllib.parse
 
 import anthropic
@@ -48,6 +50,16 @@ CATEGORIES = {
             ("פרפר", "Butterfly", "🦋"), ("ג'ירפה", "Giraffe", "🦒"),
             ("דולפין", "Dolphin", "🐬"), ("פרה", "Cow", "🐮"),
             ("צפרדע", "Frog", "🐸"), ("תרנגולת", "Chicken", "🐔"),
+            ("ארנב", "Rabbit", "🐰"), ("דב", "Bear", "🐻"),
+            ("נמר", "Tiger", "🐯"), ("זברה", "Zebra", "🦓"),
+            ("פינגווין", "Penguin", "🐧"), ("ינשוף", "Owl", "🦉"),
+            ("שועל", "Fox", "🦊"), ("ברווז", "Duck", "🦆"),
+            ("חזיר", "Pig", "🐷"), ("כבשה", "Sheep", "🐑"),
+            ("עז", "Goat", "🐐"), ("עכבר", "Mouse", "🐭"),
+            ("נחש", "Snake", "🐍"), ("צב", "Turtle", "🐢"),
+            ("דג", "Fish", "🐟"), ("קנגורו", "Kangaroo", "🦘"),
+            ("פנדה", "Panda", "🐼"), ("לווייתן", "Whale", "🐋"),
+            ("תנין", "Crocodile", "🐊"), ("דבורה", "Bee", "🐝"),
         ],
     },
     "colors": {
@@ -238,19 +250,42 @@ def save_extra(data):
     pass
 
 
-def claude_client():
-  # מפתח מ-.streamlit/secrets.toml אם קיים, אחרת ממשתני הסביבה
+def secret(name):
+  """מפתח מ-.streamlit/secrets.toml או ממשתני הסביבה (לא חובה)."""
   try:
-    key = st.secrets.get("ANTHROPIC_API_KEY")
+    key = st.secrets.get(name)
   except Exception:
     key = None
-  return anthropic.Anthropic(api_key=key) if key else anthropic.Anthropic()
+  return (key or os.environ.get(name) or "").strip()
 
 
-@st.cache_data(show_spinner=False)
-def _ai_words(request, age, avoid):
-  ages = "1-4 (very basic, concrete words)" if age == "small" else "5-8"
-  response = claude_client().beta.messages.create(
+def claude_key():
+  return secret("ANTHROPIC_API_KEY")
+
+
+def gemini_key():
+  return secret("GEMINI_API_KEY")
+
+
+def _ask_gemini(system, prompt):
+  """Gemini של Google - יש מכסה חינמית (מפתח מ-aistudio.google.com)."""
+  from google import genai
+  from google.genai import types
+
+  client = genai.Client(api_key=gemini_key())  # חייב משתנה, אחרת הוא נסגר
+  response = client.models.generate_content(
+      model="gemini-2.5-flash",
+      contents=prompt,
+      config=types.GenerateContentConfig(
+          system_instruction=system,
+          response_mime_type="application/json",
+      ),
+  )
+  return response.text
+
+
+def _ask_claude(system, prompt):
+  response = anthropic.Anthropic(api_key=claude_key()).beta.messages.create(
       model="claude-opus-5-5",
       max_tokens=4000,
       betas=["server-side-fallback-2026-07-01"],
@@ -259,31 +294,87 @@ def _ai_words(request, age, avoid):
           "effort": "low",
           "format": {"type": "json_schema", "schema": WORD_SCHEMA},
       },
-      system=(
-          "You supply vocabulary for an English-learning game for Hebrew-speaking"
-          f" children aged {ages}. Only friendly, child-appropriate, concrete"
-          " words that can be shown with a single emoji."
-      ),
-      messages=[{
-          "role": "user",
-          "content": (
-              f"Give 12 new words for: {request}.\n"
-              "For each word: hebrew = the everyday Hebrew word (no niqqud);"
-              " english = the English word, capitalized; emoji = one emoji that"
-              " best shows it; hex = for colors, the color's hex code like"
-              " #FF0000, otherwise an empty string.\n"
-              f"Do not repeat any of these: {', '.join(avoid)}"
-          ),
-      }],
+      system=system,
+      messages=[{"role": "user", "content": prompt}],
   )
   if response.stop_reason == "refusal":
     raise RuntimeError("refused")
-  text = "".join(b.text for b in response.content if b.type == "text")
-  return [
-      (w["hebrew"], w["english"], w["emoji"], w["hex"] or None)
-      for w in json.loads(text)["words"]
-      if w["english"] not in avoid
-  ]
+  return "".join(b.text for b in response.content if b.type == "text")
+
+
+def _ask_free_ai(system, prompt):
+  """AI חינמי ללא מפתח והרשמה (Pollinations)."""
+  r = requests.post(
+      "https://text.pollinations.ai/openai",
+      json={
+          "model": "openai-fast",
+          "messages": [{"role": "system", "content": system},
+                       {"role": "user", "content": prompt}],
+          "response_format": {"type": "json_object"},
+          "reasoning_effort": "low",
+      },
+      timeout=90,
+  )
+  if r.status_code in (402, 429):  # בחינם: תשובה אחת כל 30 שניות
+    raise FreeLimitError()
+  r.raise_for_status()
+  return r.json()["choices"][0]["message"]["content"]
+
+
+class FreeLimitError(Exception):
+  pass
+
+
+class TranslationUnavailable(Exception):
+  pass
+
+
+@st.cache_data(show_spinner=False)
+def _ai_words(request, age, avoid):
+  ages = "1-4 (very basic, concrete words)" if age == "small" else "5-8"
+  system = (
+      "You supply vocabulary for an English-learning game for Hebrew-speaking"
+      f" children aged {ages}. Only friendly, child-appropriate, concrete"
+      " words that can be shown with a single emoji."
+  )
+  prompt = (
+      f"Give 12 new words for: {request}.\n"
+      'Answer with JSON only: {"words": [{"hebrew": "", "english": "",'
+      ' "emoji": "", "hex": ""}]}\n'
+      "hebrew = the everyday Hebrew word (no niqqud); english = the English"
+      " word; emoji = one emoji that best shows it; hex = for colors, the"
+      " color's hex code like #FF0000, otherwise an empty string.\n"
+      f"Do not repeat any of these: {', '.join(avoid)}"
+  )
+  # Gemini (חינמי עם מפתח) > Claude (בתשלום) > Pollinations (חינמי בלי מפתח)
+  if gemini_key():
+    ask, trusted_hebrew = _ask_gemini, True
+  elif claude_key():
+    ask, trusted_hebrew = _ask_claude, True
+  else:
+    ask, trusted_hebrew = _ask_free_ai, False
+  use_claude = trusted_hebrew
+  text = ask(system, prompt).strip().strip("`").removeprefix("json")
+  raw = json.loads(text)["words"]
+  if not trusted_hebrew:
+    # העברית של ה-AI החינמי לא אמינה - מתרגמים עם Google
+    hebrew = translate_words_to_hebrew(
+        [str(w.get("english", "")).strip().capitalize() for w in raw])
+    if not hebrew:
+      raise TranslationUnavailable()
+  words = []
+  for w in raw:
+    eng = str(w.get("english", "")).strip().capitalize()
+    heb = (str(w.get("hebrew", "")).strip() if use_claude
+           else hebrew.get(eng, ""))
+    hexc = str(w.get("hex") or "").strip()
+    if "color" not in request or not re.fullmatch(r"#[0-9A-Fa-f]{6}", hexc):
+      hexc = None
+    if eng and heb and eng not in avoid:
+      words.append((heb, eng, str(w.get("emoji") or "✨"), hexc))
+  if not words:
+    raise ValueError("no words")
+  return words
 
 
 def ai_button(store_key, request, existing, label="✨ עוד מילים מ-AI"):
@@ -297,11 +388,21 @@ def ai_button(store_key, request, existing, label="✨ עוד מילים מ-AI")
     except anthropic.AuthenticationError:
       st.error("🔑 מפתח ה-API של Claude לא תקין. בדקו את ANTHROPIC_API_KEY")
       return
-    except anthropic.APIConnectionError:
-      st.error("🌐 אין חיבור ל-AI כרגע, נסו שוב מאוחר יותר")
+    except TranslationUnavailable:
+      st.warning("🌐 התרגום לעברית לא זמין כרגע - נסו שוב בעוד כמה דקות")
       return
-    except Exception as e:  # למשל: לא הוגדר מפתח בכלל
-      st.error("🔑 כדי להוסיף מילים מ-AI צריך להגדיר ANTHROPIC_API_KEY"
+    except FreeLimitError:
+      st.warning("⏳ ה-AI החינמי נותן תשובה אחת כל 30 שניות - חכו רגע ונסו שוב")
+      return
+    except Exception as e:
+      msg = str(e)
+      if "API key" in msg or "API_KEY" in msg or "PERMISSION_DENIED" in msg:
+        st.error("🔑 מפתח ה-AI לא תקין - בדקו את המפתח בקובץ .streamlit/secrets.toml")
+        return
+      if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        st.warning("⏳ נגמרה המכסה החינמית לרגע - חכו דקה ונסו שוב")
+        return
+      st.error("🌐 ה-AI לא זמין כרגע, נסו שוב בעוד רגע"
                f" (פרטים: {type(e).__name__})")
       return
   data = load_extra()
@@ -471,6 +572,27 @@ HERO = HERO.replace(
 # ---------------------------------------------------------------------------
 # כלים: תרגום, שמע, תמונה
 # ---------------------------------------------------------------------------
+def translate_words_to_hebrew(english_words):
+  """מתרגם רשימת מילים בבקשה אחת ל-Google. מחזיר {אנגלית: עברית}."""
+  google = GoogleTranslator(source="en", target="iw")
+  result = {}
+  try:
+    lines = google.translate("\n".join(english_words)).split("\n")
+    if len(lines) == len(english_words):
+      result = dict(zip(english_words, lines))
+  except Exception:
+    pass
+  for eng in english_words:  # מה שלא הצליח - מילה אחת בכל פעם
+    if eng not in result:
+      try:
+        result[eng] = google.translate(eng)
+      except Exception:
+        pass
+  # רק עברית תקינה (בלי אותיות לטיניות)
+  return {e: h.strip() for e, h in result.items()
+          if h and not re.search(r"[A-Za-z]", h)}
+
+
 def translate_hebrew_to_english(text):
   try:
     return _translate(text)
